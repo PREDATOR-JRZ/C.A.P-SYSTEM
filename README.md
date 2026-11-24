@@ -21,12 +21,13 @@ Laravel application for the CICS admissions workflow (student registration, requ
    php artisan key:generate
    ```
 3. Configure `.env` with your database and mail settings (use Mailpit/Mailtrap for local testing).
-4. Create the notifications table, run migrations, and seed the default admin account:
+4. Run migrations and seed the default admin account:
    ```bash
-   php artisan make:notifications-table
    php artisan migrate
    php artisan db:seed --class=AdminSeeder
    ```
+   The notifications table migration is already included in this repository, so you do not need to run `php artisan make:notifications-table` when setting up from a fresh clone. If that migration is ever missing, generate it with `php artisan make:notifications-table` before running migrations.
+
    Default admin: `admin@cics.test` / `ChangeMe123!` (change it immediately).
 5. Install frontend dependencies and build assets:
    ```bash
