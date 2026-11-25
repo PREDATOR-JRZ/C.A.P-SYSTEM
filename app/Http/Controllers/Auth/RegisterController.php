@@ -10,7 +10,6 @@ use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Validation\Rule;
 
-/** STEP 1 — Register a Student Account. */
 class RegisterController extends Controller
 {
     public function create()
@@ -44,11 +43,16 @@ class RegisterController extends Controller
                 'name'     => trim($data['first_name'] . ' ' . $data['last_name']),
                 'email'    => $data['email'],
                 'password' => $data['password'],
-                'role'     => 'student',
+                'role'     => User::ROLE_STUDENT,
             ]);
 
             $user->profile()->create(collect($data)->except(['email', 'password', 'password_confirmation'])->all());
-            Application::create(['user_id' => $user->id, 'stage' => 'registered']);
+            Application::create([
+                'user_id' => $user->id,
+                'stage' => 'eligibility_pending',
+                'stage_changed_at' => now(),
+                'cat_status' => 'pending_confirmation',
+            ]);
 
             return $user;
         });
@@ -56,8 +60,7 @@ class RegisterController extends Controller
         Auth::login($user);
         $request->session()->regenerate();
 
-        // Step 2 comes next
-        return redirect()->route('student.requirements.create')
-            ->with('success', 'Account created! Upload your Admission Test Result and other requirements.');
+        return redirect()->route('student.dashboard')
+            ->with('success', 'Account created. Your CAT eligibility must be confirmed by college staff before you can submit requirements.');
     }
 }
