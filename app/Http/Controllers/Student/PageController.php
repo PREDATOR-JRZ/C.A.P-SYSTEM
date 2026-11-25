@@ -7,48 +7,44 @@ use App\Models\Announcement;
 
 class PageController extends Controller
 {
-    /** Status page (Step 6 + Step 8): shows results only after the admin releases them. */
     public function status()
     {
-        $application = auth()->user()->application()->with(['examAppointment', 'interviewAppointment'])->firstOrFail();
+        $application = auth()->user()->application()->with(['examAppointment', 'interviewAppointment', 'feeClearances'])->firstOrFail();
 
         return view('student.status', compact('application'));
     }
 
-    /** Check List: process steps + the requirements for the student's status. */
     public function checklist()
     {
         $user = auth()->user();
-        $application = $user->application()->with('documents')->firstOrFail();
+        $application = $user->application()->with(['documents', 'feeClearances'])->firstOrFail();
         $rank = $application->rank;
 
         $steps = [
-            ['Register a student account', $rank >= 1],
-            ['Upload Admission Test Result & requirements', $rank >= 2],
-            ['Schedule CICS Exam', $rank >= 3],
-            ['Exam result released', $application->exam_result_released_at !== null],
-            ['Schedule Interview & submission of requirements', $rank >= 5],
-            ['Approved by CICS', in_array($application->stage, ['approved', 'batched'], true)],
-            ['Assigned to a fee payment batch', $application->stage === 'batched'],
+            ['CAT eligibility confirmed', $rank >= 2],
+            ['Requirements submitted and manually approved', $rank >= 4],
+            ['CICS evaluation exam passed', in_array($application->stage, ['exam_passed', 'interview_scheduled', 'accepted_for_clearance', 'eligible_for_official_enrollment', 'prism_pending', 'officially_enrolled'], true)],
+            ['Interview/final evaluation approved', in_array($application->stage, ['accepted_for_clearance', 'eligible_for_official_enrollment', 'prism_pending', 'officially_enrolled'], true)],
+            ['Department Fee and Insurance Fee cleared', $application->hasAllRequiredFeeClearances()],
+            ['Eligible for official PRISM enrollment', in_array($application->stage, ['eligible_for_official_enrollment', 'prism_pending', 'officially_enrolled'], true)],
+            ['Officially enrolled in PRISM', $application->stage === 'officially_enrolled'],
         ];
 
-        $labels = config('cics.requirements.' . $user->profile->student_status);
-        $uploaded = $application->documents->pluck('label')->all();
+        $labels = config('cics.requirements.' . $user->profile->student_status, []);
+        $latestDocs = $application->documents->sortByDesc('id')->unique('label')->keyBy('label');
 
         return view('student.checklist', [
             'steps'        => $steps,
-            'requirements' => collect($labels)->map(fn ($l) => [$l, in_array($l, $uploaded, true)]),
+            'requirements' => collect($labels)->map(fn ($l) => [$l, ($latestDocs[$l]->status ?? null) === 'approved' || ($latestDocs[$l]->status ?? null) === 'waived']),
             'application'  => $application,
         ]);
     }
 
-    /** Announcements (Newsfeed). */
     public function announcements()
     {
         return view('student.announcements', ['announcements' => Announcement::latest()->paginate(10)]);
     }
 
-    /** Information about the History of CICS and the Courses. */
     public function about()
     {
         return view('student.about', ['courses' => config('cics.courses')]);

@@ -1,23 +1,19 @@
 <?php
 
 return [
-    // "Appointment Schedule has only allotted student slots each day (50 students)"
     'daily_slots'     => 50,
-    'booking_window'  => 30,   // how many days ahead a student can book
-    'dispose_days'    => 30,   // failed accounts are disposed within 30 days of result release
-    'max_fee_batches' => 3,    // Step 9: group into 2-3 batches
+    'booking_window'  => 30,
+    'dispose_days'    => 30,
+    'max_fee_batches' => 3,
 
     'student_statuses' => ['Freshman', 'Transferee', 'Shifter', 'Irregular'],
 
-    // EDIT to match the real CICS offerings
     'courses' => [
         'BSIT' => 'Bachelor of Science in Information Technology',
         'BSCS' => 'Bachelor of Science in Computer Science',
         'BSIS' => 'Bachelor of Science in Information Systems',
     ],
 
-    // Requirement labels per student status. "Admission Test Result" is the mandatory
-    // upload in Step 2; the others are optional uploads and drive the Check List page.
     'requirements' => [
         'Freshman' => [
             'Admission Test Result', 'Form 138 / Report Card', 'Certificate of Good Moral Character',
@@ -35,6 +31,11 @@ return [
             'Admission Test Result', 'Copy of Grades', 'Study Load / Advising Form',
             'Certificate of Good Moral Character', '2x2 ID Pictures',
         ],
+    ],
+
+    'fee_clearances' => [
+        'department_fee' => ['label' => 'Department Fee', 'required' => true],
+        'insurance_fee' => ['label' => 'Insurance Fee', 'required' => true],
     ],
 
     'reminders' => [

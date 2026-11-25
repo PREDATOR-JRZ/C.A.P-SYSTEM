@@ -4,12 +4,19 @@ namespace App\Http\Controllers\Admin;
 
 use App\Http\Controllers\Controller;
 use App\Models\Application;
+use App\Models\Document;
+use App\Models\FeeClearance;
 use App\Notifications\StatusUpdated;
+use App\Services\ApplicationWorkflow;
 use Illuminate\Http\Request;
 use Illuminate\Validation\Rule;
 
 class ApplicationController extends Controller
 {
+    public function __construct(private readonly ApplicationWorkflow $workflow)
+    {
+    }
+
     public function index(Request $request)
     {
         $applications = Application::with(['user.profile', 'examAppointment', 'interviewAppointment'])
@@ -26,106 +33,139 @@ class ApplicationController extends Controller
 
     public function show(Application $application)
     {
-        $application->load(['user.profile', 'documents', 'examAppointment', 'interviewAppointment']);
+        $application->load(['user.profile', 'documents.reviewer', 'examAppointment', 'interviewAppointment', 'feeClearances.proofDocument', 'statusLogs.actor']);
+        $this->workflow->ensureDefaultFeeClearances($application);
 
-        return view('admin.applications.show', compact('application'));
+        return view('admin.applications.show', [
+            'application' => $application->fresh(['user.profile', 'documents.reviewer', 'examAppointment', 'interviewAppointment', 'feeClearances.proofDocument', 'statusLogs.actor']),
+        ]);
     }
 
-    /** Record the exam result. Students cannot see it until the batch is released. */
+    public function confirmEligibility(Request $request, Application $application)
+    {
+        abort_unless(auth()->user()->canReviewRequirements(), 403);
+        $data = $request->validate([
+            'cat_reference_no' => ['nullable', 'string', 'max:100'],
+            'reason' => ['nullable', 'string', 'max:500'],
+        ]);
+        $data['cat_verified_at'] = now();
+        $this->workflow->confirmEligibility($application, auth()->user(), $data);
+
+        return back()->with('success', 'CAT eligibility confirmed. Applicant can now submit college requirements.');
+    }
+
+    public function reviewDocument(Request $request, Application $application, Document $document)
+    {
+        abort_unless(auth()->user()->canReviewRequirements(), 403);
+        $data = $request->validate([
+            'status' => ['required', Rule::in([Document::STATUS_APPROVED, Document::STATUS_REJECTED, Document::STATUS_RESUBMISSION_REQUESTED, Document::STATUS_WAIVED])],
+            'note' => ['nullable', 'string', 'max:1000'],
+        ]);
+        $this->workflow->reviewDocument($application, $document, auth()->user(), $data['status'], $data['note'] ?? null);
+
+        return back()->with('success', 'Document review saved.');
+    }
+
     public function examResult(Request $request, Application $application)
     {
-        abort_unless($application->stage === 'exam_scheduled', 422, 'Student is not awaiting an exam result.');
-        $data = $request->validate(['exam_result' => ['required', Rule::in(['passed', 'failed'])]]);
-
-        $application->update($data);
+        abort_unless(auth()->user()->canRecordEvaluation(), 403);
+        $data = $request->validate([
+            'exam_result' => ['required', Rule::in(['passed', 'failed'])],
+            'exam_score' => ['nullable', 'numeric', 'min:0', 'max:100'],
+        ]);
+        $this->workflow->recordExamResult($application, auth()->user(), $data['exam_result'], isset($data['exam_score']) ? (float) $data['exam_score'] : null);
 
         return back()->with('success', 'Exam result saved (hidden from the student until you release results).');
     }
 
-    /** STEP 5→6 — "THE EXAM RESULT WAS ALREADY RELEASED". */
     public function releaseResults()
     {
-        $count = 0;
+        abort_unless(auth()->user()->canRecordEvaluation(), 403);
+        $count = $this->workflow->releaseExamResults(auth()->user());
 
         Application::with('user')
-            ->where('stage', 'exam_scheduled')
-            ->whereNotNull('exam_result')
-            ->each(function (Application $app) use (&$count) {
+            ->whereIn('stage', ['exam_passed', 'exam_failed'])
+            ->whereNotNull('exam_result_released_at')
+            ->where('exam_result_released_at', '>=', now()->subMinute())
+            ->get()
+            ->each(function (Application $app) {
                 $passed = $app->exam_result === 'passed';
-
-                $app->update([
-                    'stage'                   => $passed ? 'exam_passed' : 'exam_failed',
-                    'exam_result_released_at' => now(),
-                    // FAILED => account is disposed within 30 days
-                    'dispose_at'              => $passed ? null : now()->addDays(config('cics.dispose_days')),
-                ]);
-
                 $app->user->notify(new StatusUpdated(
                     'Your CICS exam result is out',
                     $passed
-                        ? 'Congratulations, you passed! Log in and schedule your Interview & submission of requirements.'
-                        : 'Unfortunately you did not pass the CICS exam. Your account will be removed within ' . config('cics.dispose_days') . ' days.'
+                        ? 'Congratulations, you passed the CICS evaluation exam. Log in and schedule your interview.'
+                        : 'Unfortunately you did not pass the CICS evaluation exam. Your account will be handled according to disposal policy.'
                 ));
-                $count++;
             });
 
         return back()->with('success', "Released {$count} exam result(s).");
     }
 
-    /** STEP 8 — approve / not approve after interview. */
     public function interviewResult(Request $request, Application $application)
     {
-        abort_unless($application->stage === 'interview_scheduled', 422, 'Student is not awaiting an interview evaluation.');
-        $data = $request->validate(['interview_result' => ['required', Rule::in(['approved', 'not_approved'])]]);
-
-        $approved = $data['interview_result'] === 'approved';
-
-        $application->update([
-            'interview_result' => $data['interview_result'],
-            'stage'            => $approved ? 'approved' : 'not_approved',
-            'approved_at'      => $approved ? now() : null,
+        abort_unless(auth()->user()->canRecordEvaluation(), 403);
+        $data = $request->validate([
+            'interview_result' => ['required', Rule::in(['approved', 'not_approved'])],
+            'interview_notes' => ['nullable', 'string', 'max:2000'],
         ]);
-
-        $application->user->notify(new StatusUpdated(
-            $approved ? 'You have been approved!' : 'Your application status',
+        $app = $this->workflow->recordInterviewResult($application, auth()->user(), $data['interview_result'], $data['interview_notes'] ?? null);
+        $approved = $data['interview_result'] === 'approved';
+        $app->user->notify(new StatusUpdated(
+            $approved ? 'You have been accepted for clearance' : 'Your application status',
             $approved
-                ? 'You passed the interview and your requirements were approved. You will be assigned to a fee payment batch soon.'
-                : 'Your application was not approved after the interview. Please contact the CICS office for details.'
+                ? 'You passed the interview/final evaluation. Please complete Department Fee and Insurance Fee clearance before PRISM enrollment.'
+                : 'Your application was not approved after the interview/final evaluation. Please contact the CICS office for details.'
         ));
 
         return back()->with('success', 'Interview result saved and the student was notified.');
     }
 
-    /** STEP 9 — group approved students into 2-3 batches for payment of department & other fees. */
+    public function verifyFee(Request $request, Application $application, FeeClearance $feeClearance)
+    {
+        abort_unless(auth()->user()->canReviewRequirements(), 403);
+        $data = $request->validate([
+            'status' => ['required', Rule::in(['verified_paid', 'unpaid', 'pending_verification'])],
+            'notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+        $this->workflow->verifyFee($application, $feeClearance, auth()->user(), $data['status'], $data['notes'] ?? null);
+        return back()->with('success', 'Fee clearance updated.');
+    }
+
+    public function waiveFee(Request $request, Application $application, FeeClearance $feeClearance)
+    {
+        abort_unless(auth()->user()->canRecordEvaluation(), 403);
+        $data = $request->validate([
+            'reason' => ['required', 'string', 'max:500'],
+        ]);
+        $this->workflow->waiveFee($application, $feeClearance, auth()->user(), $data['reason']);
+        return back()->with('success', 'Fee waived and audit logged.');
+    }
+
+    public function markPrismPending(Application $application)
+    {
+        abort_unless(auth()->user()->canEncodePrism(), 403);
+        $this->workflow->markPrismPending($application, auth()->user());
+        return back()->with('success', 'Application marked as PRISM encoding in progress.');
+    }
+
+    public function markOfficiallyEnrolled(Request $request, Application $application)
+    {
+        abort_unless(auth()->user()->canEncodePrism(), 403);
+        $data = $request->validate([
+            'prism_reference_no' => ['required', 'string', 'max:100'],
+            'prism_notes' => ['nullable', 'string', 'max:1000'],
+        ]);
+        $app = $this->workflow->markOfficiallyEnrolled($application, auth()->user(), $data['prism_reference_no'], $data['prism_notes'] ?? null);
+        $app->user->notify(new StatusUpdated(
+            'Officially enrolled in PRISM',
+            'Your college pre-enrollment evaluation is complete and PRISM encoding has been recorded. Reference: ' . $data['prism_reference_no']
+        ));
+
+        return back()->with('success', 'PRISM encoding recorded. Application is officially enrolled.');
+    }
+
     public function generateBatches(Request $request)
     {
-        $max = config('cics.max_fee_batches');
-        $data = $request->validate([
-            'batches' => ['required', 'integer', 'min:2', 'max:' . $max],
-            'dates'   => ['required', 'array'],
-            'dates.0' => ['required', 'date', 'after:today'],
-            'dates.1' => ['required', 'date', 'after:today'],
-            'dates.2' => ['required_if:batches,3', 'nullable', 'date', 'after:today'],
-        ]);
-
-        $apps = Application::with('user')->where('stage', 'approved')->whereNull('fee_batch')->orderBy('approved_at')->get();
-        if ($apps->isEmpty()) {
-            return back()->with('error', 'No approved students are waiting for a batch.');
-        }
-
-        $size = (int) ceil($apps->count() / $data['batches']);
-
-        foreach ($apps->chunk($size)->values() as $i => $chunk) {
-            foreach ($chunk as $app) {
-                $app->update(['stage' => 'batched', 'fee_batch' => $i + 1, 'fee_payment_date' => $data['dates'][$i]]);
-
-                $app->user->notify(new StatusUpdated(
-                    'Fee payment batch assigned',
-                    'You are in Batch ' . ($i + 1) . '. Please pay your department and other required fees on ' . \Carbon\Carbon::parse($data['dates'][$i])->format('F j, Y') . '.'
-                ));
-            }
-        }
-
-        return back()->with('success', "Grouped {$apps->count()} student(s) into {$data['batches']} batches.");
+        return back()->with('error', 'Fixed payment batching is no longer used. Use Department/Insurance fee clearance verification and PRISM handoff instead.');
     }
 }

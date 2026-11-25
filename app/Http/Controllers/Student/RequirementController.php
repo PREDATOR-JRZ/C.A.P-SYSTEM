@@ -4,13 +4,15 @@ namespace App\Http\Controllers\Student;
 
 use App\Http\Controllers\Controller;
 use App\Models\Document;
+use App\Services\ApplicationWorkflow;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
-/** STEP 2 — Upload Admission Test Result and other requirements. */
 class RequirementController extends Controller
 {
-    private const ADMISSION = 'Admission Test Result';
+    public function __construct(private readonly ApplicationWorkflow $workflow)
+    {
+    }
 
     public function create()
     {
@@ -19,57 +21,64 @@ class RequirementController extends Controller
 
         return view('student.requirements', [
             'application'  => $application,
-            'requirements' => config("cics.requirements.{$status}"),
-            'uploaded'     => $application->documents->keyBy('label'),
+            'requirements' => config("cics.requirements.{$status}", []),
+            'uploaded'     => $application->documents->sortByDesc('id')->unique('label')->keyBy('label'),
+            'canUpload'    => in_array($application->stage, ['eligible', 'requirements_returned'], true),
+            'canSubmit'    => in_array($application->stage, ['eligible', 'requirements_returned'], true),
         ]);
     }
 
     public function store(Request $request)
     {
-        $application = auth()->user()->application;
-        $already = $application->documents()->where('label', self::ADMISSION)->exists();
+        $application = auth()->user()->application()->load('documents');
+        abort_unless(in_array($application->stage, ['eligible', 'requirements_returned'], true), 403, 'Requirements cannot be uploaded at this stage.');
 
-        $rules = ['files.*' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:5120']];
-        $rules['files.' . self::ADMISSION] = [$already ? 'nullable' : 'required', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:5120'];
-
-        $request->validate($rules, [
+        $request->validate([
+            'files.*' => ['nullable', 'file', 'mimes:pdf,jpg,jpeg,png', 'max:5120'],
+        ], [
             'files.*.max'   => 'Each file must be 5 MB or smaller.',
             'files.*.mimes' => 'Files must be PDF, JPG or PNG.',
         ]);
 
-        $allowed = config('cics.requirements.' . auth()->user()->profile->student_status);
+        $allowed = config('cics.requirements.' . auth()->user()->profile->student_status, []);
 
         foreach ((array) $request->file('files') as $label => $file) {
-            // only accept labels that belong to this student's requirement list
             if (! $file || ! in_array($label, $allowed, true)) {
                 continue;
             }
 
-            // replace any earlier upload for the same requirement
-            $application->documents()->where('label', $label)->get()->each(function (Document $old) {
-                Storage::disk('local')->delete($old->path);
-                $old->delete();
-            });
+            $latest = $application->documents()->where('label', $label)->latest('id')->first();
+            if ($latest && ! $latest->canBeReplacedByStudent()) {
+                continue;
+            }
 
+            $path = $file->store("requirements/{$application->id}", 'local');
             $application->documents()->create([
-                'label'         => $label,
-                'path'          => $file->store("requirements/{$application->id}", 'local'),
+                'label' => $label,
+                'requirement_key' => str($label)->slug('_')->toString(),
+                'version' => $latest ? $latest->version + 1 : 1,
+                'status' => Document::STATUS_UPLOADED,
+                'path' => $path,
                 'original_name' => $file->getClientOriginalName(),
+                'mime_type' => $file->getClientMimeType(),
+                'size_bytes' => $file->getSize(),
+                'checksum' => hash_file('sha256', $file->getRealPath()),
+                'replaces_document_id' => $latest?->id,
             ]);
         }
 
-        if ($application->stage === 'registered' && $application->documents()->where('label', self::ADMISSION)->exists()) {
-            $application->update(['stage' => 'requirements_submitted']);
-
-            // Step 3 comes next
-            return redirect()->route('student.appointments.create', 'exam')
-                ->with('success', 'Requirements uploaded. Now pick a date for your CICS Exam.');
-        }
-
-        return back()->with('success', 'Files uploaded.');
+        return back()->with('success', 'Files uploaded. Review your uploads and click Submit for Review when ready.');
     }
 
-    /** Owner (or admin) can view an uploaded file. */
+    public function submit(Request $request)
+    {
+        $application = auth()->user()->application()->firstOrFail();
+        $this->workflow->submitRequirements($application, auth()->user());
+
+        return redirect()->route('student.dashboard')
+            ->with('success', 'Requirements submitted for manual college review.');
+    }
+
     public function show(Document $document)
     {
         $owner = $document->application->user_id === auth()->id();
